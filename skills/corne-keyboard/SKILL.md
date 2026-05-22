@@ -9,16 +9,16 @@ Set up udev rules so the Corne keyboard works seamlessly: the built-in laptop ke
 
 ## How it works
 
-The built-in keyboard is grabbed exclusively by a Python daemon (`razer-brightness-passthrough`) using `python-evdev`. This prevents all keystrokes from reaching Hyprland while forwarding only `KEY_BRIGHTNESSUP` and `KEY_BRIGHTNESSDOWN` to a virtual uinput device that Hyprland reads. On unplug, the daemon exits, releases the grab, and Hyprland resumes reading from the built-in keyboard normally.
+The built-in keyboard is grabbed exclusively by a Python daemon (`razer-brightness-passthrough`) using `python-evdev`. This prevents all keystrokes from reaching Hyprland while intercepting `KEY_BRIGHTNESSUP` and `KEY_BRIGHTNESSDOWN` and handling them directly via `brightnessctl`. On unplug, the daemon exits, releases the grab, and Hyprland resumes reading from the built-in keyboard normally.
 
-This approach is preferable to `sysfs inhibit` (`/sys/class/input/eventX/inhibited`) because inhibit blocks all events including brightness keys.
+This approach is preferable to `sysfs inhibit` (`/sys/class/input/eventX/inhibited`) because inhibit blocks all events including brightness keys. Direct `brightnessctl` invocation is preferable to forwarding to a uinput virtual device because Wayland compositors may not reliably route uinput keyboard events through their keybind dispatch chain.
 
 ## What gets installed
 
 | File | Purpose |
 |---|---|
 | `/etc/udev/rules.d/99-corne-keyboard.rules` | Starts/stops brightness passthrough service on plug/unplug |
-| `/usr/local/bin/razer-brightness-passthrough` | Python daemon: grabs keyboard, forwards only brightness keys |
+| `/usr/local/bin/razer-brightness-passthrough` | Python daemon: grabs keyboard, runs brightnessctl for brightness keys |
 | `/etc/systemd/system/razer-brightness-passthrough.service` | Systemd service wrapping the daemon |
 | `/etc/udev/rules.d/50-qmk.rules` | Grants userspace access to QMK bootloaders for flashing |
 
@@ -62,16 +62,20 @@ sudo pacman -S --needed python-evdev alsa-utils alsa-tools
 ```bash
 sudo tee /usr/local/bin/razer-brightness-passthrough << 'PYEOF'
 #!/usr/bin/env python3
-"""
-Grab the Razer built-in keyboard exclusively and forward only
-brightness key events to a virtual uinput device.
-"""
-import sys, time, signal, evdev
+import sys, time, signal, subprocess, glob, os, evdev
 from evdev import ecodes
 
 RAZER_VENDOR = 0x1532
 RAZER_PRODUCT = 0x02b8
 BRIGHTNESS_KEYS = {ecodes.KEY_BRIGHTNESSUP, ecodes.KEY_BRIGHTNESSDOWN}
+
+def find_backlight():
+    for pattern in ['amdgpu_bl*', 'intel_backlight', 'acpi_video*']:
+        matches = glob.glob(f'/sys/class/backlight/{pattern}')
+        if matches:
+            return os.path.basename(matches[0])
+    devices = os.listdir('/sys/class/backlight')
+    return devices[0] if devices else None
 
 def find_device():
     for path in evdev.list_devices():
@@ -95,21 +99,30 @@ def main():
     if not dev:
         print("Razer keyboard with brightness keys not found", file=sys.stderr)
         sys.exit(1)
-    ui = evdev.UInput({ecodes.EV_KEY: sorted(BRIGHTNESS_KEYS)}, name="razer-brightness-passthrough")
+
+    backlight = find_backlight()
+    if not backlight:
+        print("No backlight device found", file=sys.stderr)
+        sys.exit(1)
+
     dev.grab()
+
     def cleanup(signum=None, frame=None):
         try: dev.ungrab()
-        except: pass
-        try: ui.close()
         except: pass
         sys.exit(0)
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
+
     try:
         for event in dev.read_loop():
             if event.type == ecodes.EV_KEY and event.code in BRIGHTNESS_KEYS:
-                ui.write(event.type, event.code, event.value)
-                ui.syn()
+                if event.value in (1, 2):  # key-down and key-repeat
+                    step = '+5%' if event.code == ecodes.KEY_BRIGHTNESSUP else '5%-'
+                    subprocess.run(
+                        ['brightnessctl', '-d', backlight, 'set', step],
+                        capture_output=True
+                    )
     except OSError:
         pass
     finally:
@@ -198,11 +211,11 @@ groups | grep plugdev
 # Service is running while Corne is plugged in:
 systemctl status razer-brightness-passthrough.service
 
-# Virtual brightness device is visible to Hyprland:
-grep -A4 "razer-brightness-passthrough" /proc/bus/input/devices
-
 # Built-in keyboard is grabbed (Hyprland can't see regular keystrokes):
 # Just try typing in a terminal — it should produce no output while service is running
+
+# Brightness keys work — press Fn+brightness on the built-in keyboard:
+# Screen brightness should change. brightnessctl is called directly by the daemon.
 
 # Udev rule fires on plug/unplug — watch events:
 sudo udevadm monitor --environment --udev | grep -E "4653|systemctl"
