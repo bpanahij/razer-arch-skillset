@@ -11,6 +11,7 @@ Powered by [`runkids/skillshare`](https://github.com/runkids/skillshare) — a G
 | Skill | Slash command | What it does |
 |---|---|---|
 | `audio-setup` | `/razer-audio-setup` | Diagnose and fix speakers + DMIC on Razer Blade with ALC298 codec |
+| `corne-keyboard` | `/razer-corne-keyboard` | Block built-in keyboard when Corne is plugged in; fix screen brightness keys via Razer proprietary HID; QMK flashing access |
 
 More skills coming — PRs welcome.
 
