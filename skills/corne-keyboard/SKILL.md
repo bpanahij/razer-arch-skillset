@@ -1,18 +1,25 @@
 ---
 name: razer-corne-keyboard
-description: Set up udev rules for the Corne keyboard on a Razer Blade running Arch Linux / Omarchy. Covers auto-disabling the built-in laptop keyboard when the Corne is plugged in, re-enabling it on unplug, QMK firmware flashing access, and finding the correct USB vendor/product IDs. Use when the user asks about Corne keyboard setup, laptop keyboard conflict, udev rules, or QMK flashing permissions.
+description: Set up udev rules for the Corne keyboard on a Razer Blade running Arch Linux / Omarchy. Covers auto-disabling the built-in laptop keyboard when the Corne is plugged in (while keeping brightness keys working), re-enabling on unplug, QMK firmware flashing access, and finding the correct USB vendor/product IDs. Use when the user asks about Corne keyboard setup, laptop keyboard conflict, udev rules, brightness keys, or QMK flashing permissions.
 ---
 
 # /razer-corne-keyboard
 
-Set up udev rules so the Corne keyboard works seamlessly: the built-in laptop keyboard disables automatically when the Corne is plugged in and re-enables when it's unplugged. Also covers QMK flashing access.
+Set up udev rules so the Corne keyboard works seamlessly: the built-in laptop keyboard is blocked automatically when the Corne is plugged in (but brightness keys still work), and restored when unplugged. Also covers QMK flashing access.
+
+## How it works
+
+The built-in keyboard is grabbed exclusively by a Python daemon (`razer-brightness-passthrough`) using `python-evdev`. This prevents all keystrokes from reaching Hyprland while forwarding only `KEY_BRIGHTNESSUP` and `KEY_BRIGHTNESSDOWN` to a virtual uinput device that Hyprland reads. On unplug, the daemon exits, releases the grab, and Hyprland resumes reading from the built-in keyboard normally.
+
+This approach is preferable to `sysfs inhibit` (`/sys/class/input/eventX/inhibited`) because inhibit blocks all events including brightness keys.
 
 ## What gets installed
 
 | File | Purpose |
 |---|---|
-| `/etc/udev/rules.d/99-corne-keyboard.rules` | Triggers keyboard toggle on plug/unplug |
-| `/usr/local/bin/toggle-laptop-keyboard` | Inhibits/restores the Razer built-in keyboard via sysfs |
+| `/etc/udev/rules.d/99-corne-keyboard.rules` | Starts/stops brightness passthrough service on plug/unplug |
+| `/usr/local/bin/razer-brightness-passthrough` | Python daemon: grabs keyboard, forwards only brightness keys |
+| `/etc/systemd/system/razer-brightness-passthrough.service` | Systemd service wrapping the daemon |
 | `/etc/udev/rules.d/50-qmk.rules` | Grants userspace access to QMK bootloaders for flashing |
 
 ---
@@ -42,63 +49,122 @@ If your IDs differ, substitute them everywhere below.
 
 ---
 
-## Step 1 — Install the toggle script
+## Step 1 — Install required packages
 
 ```bash
-sudo tee /usr/local/bin/toggle-laptop-keyboard << 'EOF'
-#!/bin/bash
-# 0 = enable, 1 = disable
-VALUE="${1:-1}"
-
-in_razer=0
-while IFS= read -r line; do
-    if [[ "$line" == N:* ]]; then
-        if [[ "$line" == *'Razer Razer Blade'* ]]; then
-            in_razer=1
-        else
-            in_razer=0
-        fi
-    elif [[ "$in_razer" == 1 && "$line" == H:*kbd*event* ]]; then
-        event=$(echo "$line" | grep -oP 'event\d+')
-        [[ -z "$event" ]] && continue
-        input_dir=$(dirname "$(readlink -f "/sys/class/input/$event")")
-        [[ -f "$input_dir/inhibited" ]] && echo "$VALUE" > "$input_dir/inhibited"
-    fi
-done < /proc/bus/input/devices
-EOF
-
-sudo chmod +x /usr/local/bin/toggle-laptop-keyboard
-```
-
-Test it manually before wiring up udev:
-
-```bash
-# Disable built-in keyboard (should stop responding to keypresses):
-sudo /usr/local/bin/toggle-laptop-keyboard 1
-# Re-enable:
-sudo /usr/local/bin/toggle-laptop-keyboard 0
+sudo pacman -S --needed python-evdev alsa-utils alsa-tools
 ```
 
 ---
 
-## Step 2 — Install the Corne udev rule
+## Step 2 — Install the brightness passthrough daemon
+
+```bash
+sudo tee /usr/local/bin/razer-brightness-passthrough << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Grab the Razer built-in keyboard exclusively and forward only
+brightness key events to a virtual uinput device.
+"""
+import sys, time, signal, evdev
+from evdev import ecodes
+
+RAZER_VENDOR = 0x1532
+RAZER_PRODUCT = 0x02b8
+BRIGHTNESS_KEYS = {ecodes.KEY_BRIGHTNESSUP, ecodes.KEY_BRIGHTNESSDOWN}
+
+def find_device():
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            if dev.info.vendor == RAZER_VENDOR and dev.info.product == RAZER_PRODUCT:
+                caps = dev.capabilities().get(ecodes.EV_KEY, [])
+                if ecodes.KEY_BRIGHTNESSUP in caps:
+                    return dev
+            dev.close()
+        except (PermissionError, OSError):
+            pass
+    return None
+
+def main():
+    dev = None
+    for _ in range(30):
+        dev = find_device()
+        if dev: break
+        time.sleep(0.1)
+    if not dev:
+        print("Razer keyboard with brightness keys not found", file=sys.stderr)
+        sys.exit(1)
+    ui = evdev.UInput({ecodes.EV_KEY: sorted(BRIGHTNESS_KEYS)}, name="razer-brightness-passthrough")
+    dev.grab()
+    def cleanup(signum=None, frame=None):
+        try: dev.ungrab()
+        except: pass
+        try: ui.close()
+        except: pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    try:
+        for event in dev.read_loop():
+            if event.type == ecodes.EV_KEY and event.code in BRIGHTNESS_KEYS:
+                ui.write(event.type, event.code, event.value)
+                ui.syn()
+    except OSError:
+        pass
+    finally:
+        cleanup()
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+sudo chmod +x /usr/local/bin/razer-brightness-passthrough
+
+sudo tee /etc/systemd/system/razer-brightness-passthrough.service << 'EOF'
+[Unit]
+Description=Razer built-in keyboard brightness passthrough (active while Corne is connected)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/razer-brightness-passthrough
+Restart=no
+EOF
+
+sudo systemctl daemon-reload
+```
+
+Test it manually:
+
+```bash
+sudo systemctl start razer-brightness-passthrough.service
+sudo systemctl status razer-brightness-passthrough.service   # should be active (running)
+# Try the built-in keyboard — regular keys should be blocked
+# Try the brightness keys — should still work
+sudo systemctl stop razer-brightness-passthrough.service
+# Built-in keyboard should now work normally again
+```
+
+---
+
+## Step 3 — Install the Corne udev rule
 
 Replace `4653` / `0001` with your actual VID:PID from Step 0 if different.
 
 ```bash
 sudo tee /etc/udev/rules.d/99-corne-keyboard.rules << 'EOF'
-ACTION=="add",    SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="4653", ATTRS{idProduct}=="0001", RUN+="/usr/local/bin/toggle-laptop-keyboard 1"
-ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="4653", ATTRS{idProduct}=="0001", RUN+="/usr/local/bin/toggle-laptop-keyboard 0"
+ACTION=="add",    SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="4653", ATTRS{idProduct}=="0001", RUN+="/bin/systemctl start razer-brightness-passthrough.service"
+ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="4653", ATTRS{idProduct}=="0001", RUN+="/bin/systemctl stop razer-brightness-passthrough.service"
 EOF
 
 sudo udevadm control --reload-rules
 ```
 
-Unplug and re-plug the Corne to test — the built-in keyboard should go silent.
+Unplug and re-plug the Corne to test — built-in keyboard should be blocked, brightness keys should still work.
 
 ---
 
-## Step 3 — Install QMK flashing rules
+## Step 4 — Install QMK flashing rules
 
 These grant your user account access to the keyboard's bootloader so `qmk flash` works without sudo.
 
@@ -129,18 +195,17 @@ groups | grep plugdev
 ## Verification
 
 ```bash
-# Rules are loaded:
-sudo udevadm test $(udevadm info -q path -n /dev/bus/usb/$(lsusb | grep 4653 | awk '{print $2"/"substr($4,1,3)}')) 2>&1 | grep -i "toggle\|run\|corne"
+# Service is running while Corne is plugged in:
+systemctl status razer-brightness-passthrough.service
 
-# Inhibit sysfs nodes exist for the built-in keyboard:
-grep -A5 'Razer Razer Blade' /proc/bus/input/devices | grep "H:.*kbd"
+# Virtual brightness device is visible to Hyprland:
+grep -A4 "razer-brightness-passthrough" /proc/bus/input/devices
 
-# Current inhibit state (0 = active, 1 = inhibited):
-for e in /sys/class/input/event*/; do
-  inh="$e/inhibited"
-  name=$(cat "$(dirname $(readlink -f $e))/name" 2>/dev/null)
-  [[ -f "$inh" && "$name" == *Razer* ]] && echo "$name: $(cat $inh)"
-done
+# Built-in keyboard is grabbed (Hyprland can't see regular keystrokes):
+# Just try typing in a terminal — it should produce no output while service is running
+
+# Udev rule fires on plug/unplug — watch events:
+sudo udevadm monitor --environment --udev | grep -E "4653|systemctl"
 ```
 
 ---
@@ -149,46 +214,39 @@ done
 
 ### Built-in keyboard stays active after plugging in the Corne
 
-Check that the rule fires and the script runs:
+Check that the service started:
 
 ```bash
-# Watch udev events while plugging in the Corne:
-sudo udevadm monitor --environment --udev | grep -E "4653|toggle|corne"
+systemctl status razer-brightness-passthrough.service
+journalctl -u razer-brightness-passthrough.service -n 20
 ```
 
-If the rule doesn't fire, confirm the VID:PID matches:
+If the service fails with "keyboard not found", check the VID:PID in the udev rule matches `lsusb` output, and verify the device has `KEY_BRIGHTNESSUP` capability:
 
 ```bash
-lsusb   # look for the Corne entry and compare with the rule
+sudo python3 -c "
+import evdev
+for p in evdev.list_devices():
+    d = evdev.InputDevice(p)
+    if d.info.vendor == 0x1532:
+        print(p, d.name, hex(d.info.vendor), hex(d.info.product))
+        print('  brightness:', evdev.ecodes.KEY_BRIGHTNESSUP in d.capabilities().get(evdev.ecodes.EV_KEY, []))
+"
 ```
 
-If the rule fires but the keyboard stays on, run the script manually with debug output:
+### Built-in keyboard stays blocked after unplugging the Corne
+
+The `remove` rule may not have fired (abrupt disconnect). Stop the service manually:
 
 ```bash
-sudo bash -x /usr/local/bin/toggle-laptop-keyboard 1
+sudo systemctl stop razer-brightness-passthrough.service
 ```
 
-Look for the `event\d+` match — if it's empty, the Razer keyboard node name in `/proc/bus/input/devices` might differ. Check:
+As a safety net, the service can be stopped at login by adding to your shell rc:
 
 ```bash
-grep -A10 'Razer' /proc/bus/input/devices | grep "^N:"
-```
-
-Update the `'Razer Razer Blade'` string in the script to match.
-
-### Built-in keyboard stays disabled after unplugging the Corne
-
-The `remove` rule may not have fired (e.g. abrupt disconnect). Re-enable manually:
-
-```bash
-sudo /usr/local/bin/toggle-laptop-keyboard 0
-```
-
-To make this automatic at login as a safety net, add to your shell rc:
-
-```bash
-# Re-enable built-in keyboard on login (in case it was left inhibited)
-/usr/local/bin/toggle-laptop-keyboard 0
+# Release keyboard grab if Corne was disconnected without clean udev remove
+systemctl is-active razer-brightness-passthrough.service &>/dev/null && sudo systemctl stop razer-brightness-passthrough.service
 ```
 
 ### `qmk flash` fails with permission denied
