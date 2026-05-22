@@ -1,25 +1,45 @@
 ---
 name: razer-corne-keyboard
-description: Set up udev rules for the Corne keyboard on a Razer Blade running Arch Linux / Omarchy. Covers auto-disabling the built-in laptop keyboard when the Corne is plugged in (while keeping brightness keys working), re-enabling on unplug, QMK firmware flashing access, and finding the correct USB vendor/product IDs. Use when the user asks about Corne keyboard setup, laptop keyboard conflict, udev rules, brightness keys, or QMK flashing permissions.
+description: Set up udev rules for the Corne keyboard on a Razer Blade running Arch Linux / Omarchy. Covers auto-disabling the built-in laptop keyboard when the Corne is plugged in (while keeping brightness keys working), re-enabling on unplug, screen brightness key fix via proprietary Razer HID, QMK firmware flashing access, and finding the correct USB vendor/product IDs. Use when the user asks about Corne keyboard setup, laptop keyboard conflict, udev rules, brightness keys, screen brightness not working, or QMK flashing permissions.
 ---
 
 # /razer-corne-keyboard
 
-Set up udev rules so the Corne keyboard works seamlessly: the built-in laptop keyboard is blocked automatically when the Corne is plugged in (but brightness keys still work), and restored when unplugged. Also covers QMK flashing access.
+Set up udev rules so the Corne keyboard works seamlessly: the built-in laptop keyboard is blocked automatically when the Corne is plugged in, and restored when unplugged. Screen brightness keys work at all times via a separate HID daemon. Also covers QMK flashing access.
 
 ## How it works
 
-The built-in keyboard is grabbed exclusively by a Python daemon (`razer-brightness-passthrough`) using `python-evdev`. This prevents all keystrokes from reaching Hyprland while intercepting `KEY_BRIGHTNESSUP` and `KEY_BRIGHTNESSDOWN` and handling them directly via `brightnessctl`. On unplug, the daemon exits, releases the grab, and Hyprland resumes reading from the built-in keyboard normally.
+Two daemons run in parallel:
 
-This approach is preferable to `sysfs inhibit` (`/sys/class/input/eventX/inhibited`) because inhibit blocks all events including brightness keys. Direct `brightnessctl` invocation is preferable to forwarding to a uinput virtual device because Wayland compositors may not reliably route uinput keyboard events through their keybind dispatch chain.
+**`razer-brightness-passthrough`** — started/stopped by udev when the Corne is plugged in or unplugged. It uses `python-evdev` to exclusively grab the built-in keyboard (`/dev/input/eventX`), blocking all keystrokes from reaching Hyprland. On unplug it exits, releasing the grab.
+
+**`razer-brightness-hid`** — runs permanently at boot. On the Razer Blade the screen brightness keys do **not** generate standard Linux input events (evdev). Instead the firmware sends proprietary Razer HID reports over the keyboard's raw HID interface (`/dev/hidrawX`). This daemon reads those reports, detects brightness up/down key codes, and calls `brightnessctl` directly.
+
+### Why not evdev for brightness?
+
+The Razer Blade EC firmware handles brightness key presses entirely at the hardware level with no ACPI notification to the OS. Monitoring all 28 `/dev/input/event*` devices (including `Intel HID events` and `Video Bus`) shows zero events when brightness keys are pressed. The proprietary Razer HID interface (hidraw) is the only path that reports them.
+
+Report format on the brightness HID interface (16 bytes):
+```
+[0x01] [0x00] [0x43] [keycode] [second-key] [0x00 ...]
+  keycode 0x42 = brightness UP
+  keycode 0x41 = brightness DOWN
+  keycode 0x00 = all released
+```
+
+### Why not sysfs inhibit for keyboard block?
+
+`/sys/class/input/eventX/inhibited` blocks all events including brightness keys. The evdev exclusive grab approach is preferable because it lets the daemon selectively handle events (even though in practice brightness events come through hidraw, not evdev, on this model).
 
 ## What gets installed
 
 | File | Purpose |
 |---|---|
-| `/etc/udev/rules.d/99-corne-keyboard.rules` | Starts/stops brightness passthrough service on plug/unplug |
-| `/usr/local/bin/razer-brightness-passthrough` | Python daemon: grabs keyboard, runs brightnessctl for brightness keys |
-| `/etc/systemd/system/razer-brightness-passthrough.service` | Systemd service wrapping the daemon |
+| `/etc/udev/rules.d/99-corne-keyboard.rules` | Starts/stops keyboard passthrough service on Corne plug/unplug |
+| `/usr/local/bin/razer-brightness-passthrough` | Python daemon: grabs built-in keyboard while Corne is connected |
+| `/etc/systemd/system/razer-brightness-passthrough.service` | Systemd service wrapping the passthrough daemon |
+| `/usr/local/bin/razer-brightness-hid` | Python daemon: reads Razer HID brightness reports, drives brightnessctl |
+| `/etc/systemd/system/razer-brightness-hid.service` | Systemd service wrapping the HID daemon (always enabled) |
 | `/etc/udev/rules.d/50-qmk.rules` | Grants userspace access to QMK bootloaders for flashing |
 
 ---
@@ -57,7 +77,9 @@ sudo pacman -S --needed python-evdev alsa-utils alsa-tools
 
 ---
 
-## Step 2 — Install the brightness passthrough daemon
+## Step 2 — Install the keyboard passthrough daemon
+
+This daemon grabs the built-in keyboard so Hyprland can't see it while the Corne is connected.
 
 ```bash
 sudo tee /usr/local/bin/razer-brightness-passthrough << 'PYEOF'
@@ -116,8 +138,11 @@ def main():
 
     try:
         for event in dev.read_loop():
+            # Brightness events don't actually arrive via evdev on the Razer Blade —
+            # they come through the proprietary HID interface (see razer-brightness-hid).
+            # This handler is kept as a safety net for other models.
             if event.type == ecodes.EV_KEY and event.code in BRIGHTNESS_KEYS:
-                if event.value in (1, 2):  # key-down and key-repeat
+                if event.value in (1, 2):
                     step = '+5%' if event.code == ecodes.KEY_BRIGHTNESSUP else '5%-'
                     subprocess.run(
                         ['brightnessctl', '-d', backlight, 'set', step],
@@ -147,20 +172,145 @@ EOF
 sudo systemctl daemon-reload
 ```
 
-Test it manually:
+---
+
+## Step 3 — Install the screen brightness HID daemon
+
+On the Razer Blade, screen brightness keys do not generate standard Linux input events. The firmware sends proprietary HID reports over the raw HID interface instead. This daemon intercepts them.
 
 ```bash
-sudo systemctl start razer-brightness-passthrough.service
-sudo systemctl status razer-brightness-passthrough.service   # should be active (running)
-# Try the built-in keyboard — regular keys should be blocked
-# Try the brightness keys — should still work
-sudo systemctl stop razer-brightness-passthrough.service
-# Built-in keyboard should now work normally again
+sudo tee /usr/local/bin/razer-brightness-hid << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Monitor Razer laptop keyboard proprietary HID interface for brightness key reports
+and drive intel_backlight directly via brightnessctl.
+
+Report format (16 bytes):
+  [0x01] [0x00] [0x43] [keycode] [optional-2nd-key] [0x00...]
+  keycode 0x42 = brightness UP, 0x41 = brightness DOWN, 0x00 = all released
+"""
+import sys, os, time, signal, select, subprocess, glob
+
+RAZER_VENDOR_PID = "00001532:000002B8"
+REPORT_MAGIC  = (0x01, 0x00, 0x43)
+KEY_UP_CODE   = 0x42
+KEY_DOWN_CODE = 0x41
+REPEAT_DELAY  = 0.15   # seconds between repeat calls while key is held
+
+def find_backlight():
+    for pattern in ['intel_backlight', 'acpi_video*']:
+        matches = glob.glob(f'/sys/class/backlight/{pattern}')
+        if matches:
+            return os.path.basename(matches[0])
+    entries = os.listdir('/sys/class/backlight')
+    return entries[0] if entries else None
+
+def find_razer_hidraw():
+    paths = []
+    for d in glob.glob('/sys/class/hidraw/hidraw*/'):
+        try:
+            uevent = open(os.path.join(d, 'device', 'uevent')).read()
+            if RAZER_VENDOR_PID.upper() in uevent.upper():
+                node = os.path.basename(d.rstrip('/'))
+                paths.append(f'/dev/{node}')
+        except OSError:
+            pass
+    return sorted(paths)
+
+def set_brightness(backlight, step):
+    subprocess.run(['brightnessctl', '-d', backlight, 'set', step],
+                   capture_output=True)
+
+def main():
+    backlight = find_backlight()
+    if not backlight:
+        print("No backlight device found", file=sys.stderr)
+        sys.exit(1)
+
+    hidraw_paths = find_razer_hidraw()
+    if not hidraw_paths:
+        print("No Razer hidraw devices found — retrying in 3s", file=sys.stderr)
+        time.sleep(3)
+        hidraw_paths = find_razer_hidraw()
+    if not hidraw_paths:
+        sys.exit(1)
+
+    fds = {}
+    for path in hidraw_paths:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            fds[fd] = path
+        except OSError:
+            pass
+
+    if not fds:
+        print("Could not open any Razer hidraw device", file=sys.stderr)
+        sys.exit(1)
+
+    state = {fd: (0x00, 0.0) for fd in fds}
+
+    def cleanup(signum=None, frame=None):
+        for fd in fds:
+            try: os.close(fd)
+            except: pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    while True:
+        readable, _, _ = select.select(list(fds.keys()), [], [], 5)
+        for fd in readable:
+            try:
+                data = os.read(fd, 64)
+            except OSError:
+                continue
+            if len(data) < 4:
+                continue
+            if data[0] != REPORT_MAGIC[0] or data[1] != REPORT_MAGIC[1] or data[2] != REPORT_MAGIC[2]:
+                continue
+
+            key = data[3]
+            last_key, last_action_time = state[fd]
+            now = time.monotonic()
+
+            if key in (KEY_UP_CODE, KEY_DOWN_CODE):
+                is_new_press = (last_key != key)
+                is_repeat    = (now - last_action_time) >= REPEAT_DELAY
+                if is_new_press or is_repeat:
+                    step = '+5%' if key == KEY_UP_CODE else '5%-'
+                    set_brightness(backlight, step)
+                    state[fd] = (key, now)
+            else:
+                state[fd] = (0x00, last_action_time)
+
+if __name__ == '__main__':
+    main()
+PYEOF
+
+sudo chmod +x /usr/local/bin/razer-brightness-hid
+
+sudo tee /etc/systemd/system/razer-brightness-hid.service << 'EOF'
+[Unit]
+Description=Razer laptop keyboard screen brightness key handler (HID)
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/razer-brightness-hid
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now razer-brightness-hid.service
 ```
 
 ---
 
-## Step 3 — Install the Corne udev rule
+## Step 4 — Install the Corne udev rule
 
 Replace `4653` / `0001` with your actual VID:PID from Step 0 if different.
 
@@ -173,11 +323,11 @@ EOF
 sudo udevadm control --reload-rules
 ```
 
-Unplug and re-plug the Corne to test — built-in keyboard should be blocked, brightness keys should still work.
+Unplug and re-plug the Corne to test — built-in keyboard should be blocked, screen brightness keys should still work.
 
 ---
 
-## Step 4 — Install QMK flashing rules
+## Step 5 — Install QMK flashing rules
 
 These grant your user account access to the keyboard's bootloader so `qmk flash` works without sudo.
 
@@ -208,16 +358,20 @@ groups | grep plugdev
 ## Verification
 
 ```bash
-# Service is running while Corne is plugged in:
+# HID brightness daemon is running (always):
+systemctl status razer-brightness-hid.service
+
+# Passthrough daemon is running (only while Corne is plugged in):
 systemctl status razer-brightness-passthrough.service
 
-# Built-in keyboard is grabbed (Hyprland can't see regular keystrokes):
-# Just try typing in a terminal — it should produce no output while service is running
+# Screen brightness keys work — press brightness up/down on built-in keyboard:
+# Brightness should change even with Corne plugged in.
+watch -n0.5 cat /sys/class/backlight/intel_backlight/brightness
 
-# Brightness keys work — press Fn+brightness on the built-in keyboard:
-# Screen brightness should change. brightnessctl is called directly by the daemon.
+# Built-in keyboard is blocked (Hyprland can't see regular keystrokes):
+# Try typing in a terminal while Corne is plugged in — it should produce no output.
 
-# Udev rule fires on plug/unplug — watch events:
+# Udev rule fires on plug/unplug:
 sudo udevadm monitor --environment --udev | grep -E "4653|systemctl"
 ```
 
@@ -225,16 +379,43 @@ sudo udevadm monitor --environment --udev | grep -E "4653|systemctl"
 
 ## Troubleshooting
 
+### Screen brightness keys don't work
+
+Check the HID daemon is running and finding Razer devices:
+
+```bash
+systemctl status razer-brightness-hid.service
+journalctl -u razer-brightness-hid.service -n 20
+```
+
+Verify the Razer hidraw devices are visible:
+
+```bash
+for d in /sys/class/hidraw/hidraw*/; do
+  uevent="$d/device/uevent"
+  name=$(grep HID_ID "$uevent" 2>/dev/null)
+  echo "$(basename $d): $name"
+done | grep -i 1532
+```
+
+If the daemon starts but brightness still doesn't change, confirm which backlight device is active:
+
+```bash
+ls /sys/class/backlight/
+# Should show intel_backlight — test directly:
+brightnessctl -d intel_backlight set 50%
+```
+
 ### Built-in keyboard stays active after plugging in the Corne
 
-Check that the service started:
+Check that the passthrough service started:
 
 ```bash
 systemctl status razer-brightness-passthrough.service
 journalctl -u razer-brightness-passthrough.service -n 20
 ```
 
-If the service fails with "keyboard not found", check the VID:PID in the udev rule matches `lsusb` output, and verify the device has `KEY_BRIGHTNESSUP` capability:
+If the service fails with "keyboard not found", verify the device has `KEY_BRIGHTNESSUP` capability:
 
 ```bash
 sudo python3 -c "
@@ -255,7 +436,7 @@ The `remove` rule may not have fired (abrupt disconnect). Stop the service manua
 sudo systemctl stop razer-brightness-passthrough.service
 ```
 
-As a safety net, the service can be stopped at login by adding to your shell rc:
+As a safety net, add to your shell rc:
 
 ```bash
 # Release keyboard grab if Corne was disconnected without clean udev remove
