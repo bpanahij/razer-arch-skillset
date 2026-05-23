@@ -109,7 +109,8 @@ paplay /tmp/test_tone.wav
 ### 2d. Install for persistence
 
 ```bash
-sudo cp /tmp/rb-sound-fix.sh /usr/local/bin/razer-audio-init.sh
+# Prepend shebang (the upstream script omits it; systemd requires it for direct exec)
+echo '#!/bin/bash' | cat - /tmp/rb-sound-fix.sh | sudo tee /usr/local/bin/razer-audio-init.sh > /dev/null
 sudo chmod +x /usr/local/bin/razer-audio-init.sh
 
 sudo tee /etc/systemd/system/razer-audio-init.service << 'EOF'
